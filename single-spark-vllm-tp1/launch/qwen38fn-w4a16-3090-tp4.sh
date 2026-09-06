@@ -2,7 +2,7 @@
 # Qwen3.8-Flash-Next on the 4x RTX 3090 box (x86, Ampere), vLLM TP4, albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE
 # (Intel AutoRound W4A16 experts in GPTQ layout + RadixArk FP8 n-gram table) with OUR disk-table patch so the 47.7 GB
 # table never has to be resident (the box has 31 GB of RAM). Kai / 2Wild, 2026-09-06. Experimental.
-# Knobs: NCCL_MODE (nvl|nop2p), PLE_MODE (staged|mmap|none), GRAPHS (nocompile|eager|piecewise|default), MTP (0|N; N needs a draft the checkpoint
+# Knobs: NCCL_MODE (nvl|nop2p), KV_BYTES, LM_ONLY (0|1), PLE_MODE (staged|mmap|none), GRAPHS (nocompile|eager|piecewise|default), MTP (0|N; N needs a draft the checkpoint
 # does not carry in-tree, see albucino's runtime/mtp-int4-g32), SEQS, CHUNK, GMU, MAXLEN, KV_DTYPE, TP, MODULE (vLLM subpackage
 # that implements this checkpoint; nvidia = the ModelOpt-era layout our overlays target), OVERLAYS, EXTRA, DOCKER_EXTRA.
 set -euo pipefail
@@ -26,8 +26,9 @@ PLE_ENV=(); case "$PLE_MODE" in
   *) echo "PLE_MODE must be staged|mmap|none" >&2; exit 2 ;;
 esac
 OVERLAY_MOUNT=(); if [ "$OVERLAYS" = "1" ]; then
-  OVERLAY_MOUNT=(-v "$PATCH_DIR/upstream-overlays/ops_ple.py:$MP/ops/ple.py:ro" -v "$PATCH_DIR/upstream-overlays/ops_qsa.py:$MP/ops/qsa.py:ro"
-                 -v "$PATCH_DIR/upstream-overlays/qsa.py:$MP/qsa.py:ro" -v "$PATCH_DIR/upstream-overlays/platforms_interface.py:$VP/platforms/interface.py:ro"); fi
+  QSA_SFX=""; if [ "$KV_DTYPE" = "fp8_e5m2" ]; then QSA_SFX="_e5m2"; fi   # Ampere: e5m2 variant of the QSA overlay (no fp8e4nv in Triton)
+  OVERLAY_MOUNT=(-v "$PATCH_DIR/upstream-overlays/ops_ple.py:$MP/ops/ple.py:ro" -v "$PATCH_DIR/upstream-overlays/ops_qsa$QSA_SFX.py:$MP/ops/qsa.py:ro"
+                 -v "$PATCH_DIR/upstream-overlays/qsa$QSA_SFX.py:$MP/qsa.py:ro" -v "$PATCH_DIR/upstream-overlays/platforms_interface.py:$VP/platforms/interface.py:ro"); fi
 GRAPH_ARGS=(); GRAPH_MOUNT=(); case "$GRAPHS" in
   eager)     GRAPH_ARGS=(--enforce-eager) ;;
   piecewise) GRAPH_ARGS=(--compilation-config '{"cudagraph_mode":"PIECEWISE"}'); GRAPH_MOUNT=(-v "$PATCH_DIR/compilation.py:$VP/config/compilation.py:ro") ;;
@@ -36,6 +37,9 @@ GRAPH_ARGS=(); GRAPH_MOUNT=(); case "$GRAPHS" in
   *) echo "GRAPHS must be eager|piecewise|nocompile|default" >&2; exit 2 ;;
 esac
 KV_ARGS=(); if [ "$KV_DTYPE" != "auto" ]; then KV_ARGS=(--kv-cache-dtype "$KV_DTYPE"); fi
+# KV_BYTES=<bytes>: hand vLLM an explicit KV budget (it prints the number it could have used at boot); LM_ONLY=1 drops the vision tower
+if [ -n "${KV_BYTES:-}" ]; then KV_ARGS+=(--kv-cache-memory-bytes "$KV_BYTES"); fi
+LM_ONLY="${LM_ONLY:-0}"; LMO_ARGS=(); if [ "$LM_ONLY" = "1" ]; then LMO_ARGS=(--language-model-only); fi
 # NCCL transport on this board: two NVLink pairs (0-1 NV2, 2-3 NV4) joined only by PCIe through the host bridge.
 #   NCCL_MODE=nvl   -> NCCL_P2P_LEVEL=NVL: P2P over NVLink inside a pair, shared memory across pairs (default)
 #   NCCL_MODE=nop2p -> NCCL_P2P_DISABLE=1 (what the 27B lane used; also disables NVLink transport)
@@ -66,6 +70,6 @@ docker run --gpus all -d --name "$NAME" --restart no \
     --no-enable-prefix-caching \
     --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_xml \
     --default-chat-template-kwargs "{\"enable_thinking\": false}" \
-    "${SPEC[@]}" "${GRAPH_ARGS[@]}" "${KV_ARGS[@]}" ${EXTRA:-}
+    "${SPEC[@]}" "${GRAPH_ARGS[@]}" "${KV_ARGS[@]}" "${LMO_ARGS[@]}" ${EXTRA:-}
 echo "launched $NAME image=$IMAGE module=$MODULE ple=$PLE_MODE graphs=$GRAPHS kv=$KV_DTYPE tp=$TP gmu=$GMU maxlen=$MAXLEN seqs=$SEQS mtp=$MTP"
 sleep 3; docker ps --format "{{.Names}} {{.Status}}" | grep "$NAME" || { echo "$NAME exited"; docker logs "$NAME" 2>&1 | tail -5; exit 1; }
