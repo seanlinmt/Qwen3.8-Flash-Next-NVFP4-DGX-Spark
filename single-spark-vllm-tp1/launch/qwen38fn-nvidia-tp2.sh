@@ -11,17 +11,20 @@ set -euo pipefail
 NODE_RANK="${1:?usage: qwen38fn-nvidia-tp2.sh <0|1>}"
 IMAGE="${IMAGE:-vllm/vllm-openai:nightly-8a728663c1c3eeace834a95f5654fa653cc1998c}"
 NAME="${NAME:-vllm_qwen38fn}"
-MODEL_HOST="${MODEL_HOST:-/var/tmp/models/Qwen3.8-Flash-Next-NVFP4-nvidia}"
-PATCH_DIR="${PATCH_DIR:-$HOME/patches/qwen4exp-ple-mmap}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODEL_HOST="${MODEL_HOST:-/mnt/nvmeof/huggingface/hub/models--dealignai--Qwen3.8-Flash-Next-ABLITERATED-NVFP4/snapshots/be794b990578ef3031eccf9f28e675a289a09ee9}"
+PATCH_DIR="${PATCH_DIR:-$(cd "$SCRIPT_DIR/../patch" && pwd)}"
 PLE_MODE="${PLE_MODE:-none}"       # SPEED default (2026-09-05 evening): table in unified memory. CONTEXT: PLE_MODE=mmap
-GMU="${GMU:-0.70}"; MAXLEN="${MAXLEN:-262144}"; SEQS="${SEQS:-6}"; MTP="${MTP:-3}"; PORT="${PORT:-8000}"
+GMU="${GMU:-0.70}"; MAXLEN="${MAXLEN:-262144}"; SEQS="${SEQS:-6}"; MTP="${MTP:-3}"; PORT="${PORT:-8888}"
 CHUNK="${CHUNK:-4096}"              # --max-num-batched-tokens; the single biggest speed lever measured on GB10 (see README)
 KV_DTYPE="${KV_DTYPE:-fp8_e4m3}"; GRAPHS="${GRAPHS:-nocompile}"; OVERLAYS="${OVERLAYS:-1}"
-LANE="${LANE:-B}"
+DRAFT_VOCAB="${DRAFT_VOCAB:-65536}"
+LANE="${LANE:-AI}"
 case "$LANE" in
-  B) HEAD_IP="192.168.192.2"; WORKER_IP="192.168.192.4"; MPORT="${MPORT:-29531}" ;;  # Reddie head, Spark4 worker
-  A) HEAD_IP="192.168.192.1"; WORKER_IP="192.168.192.3"; MPORT="${MPORT:-29532}" ;;  # Bluey head, Asusi worker
-  *) echo "LANE must be A or B" >&2; exit 2 ;;
+  AI) HEAD_IP="192.168.177.11"; WORKER_IP="192.168.177.12"; MPORT="${MPORT:-29532}"; ADDR_RANGE="192.168.177.0/24" ;;  # AI1 head, AI2 worker
+  B)  HEAD_IP="192.168.192.2";  WORKER_IP="192.168.192.4";  MPORT="${MPORT:-29531}"; ADDR_RANGE="192.168.192.0/24" ;;  # Reddie head, Spark4 worker
+  A)  HEAD_IP="192.168.192.1";  WORKER_IP="192.168.192.3";  MPORT="${MPORT:-29532}"; ADDR_RANGE="192.168.192.0/24" ;;  # Bluey head, Asusi worker
+  *) echo "LANE must be AI, A, or B" >&2; exit 2 ;;
 esac
 case "$NODE_RANK" in
   0) HOST_IP="$HEAD_IP"; HEADLESS="" ;;               # head, serves :PORT
@@ -31,14 +34,14 @@ esac
 CACHE_HOST="/var/tmp/qwen38fn-vllm-cache"; mkdir -p "$CACHE_HOST"
 test -f "$MODEL_HOST/config.json" || { echo "MODEL MISSING at $MODEL_HOST (each rank needs a readable copy: local NVMe, or an NFS mount when PLE_MODE=none)" >&2; exit 3; }
 VP=/usr/local/lib/python3.12/dist-packages/vllm
-PLE_ENV=(); PLE_MOUNT=()
+PLE_ENV=()
+PLE_MOUNT=(-v "$PATCH_DIR/ple_layer.py:$VP/models/qwen4_exp/nvidia/ple_layer.py:ro"
+           -v "$PATCH_DIR/ple_mmap.py:$VP/models/qwen4_exp/nvidia/ops/ple_mmap.py:ro")
 if [ "$PLE_MODE" = "mmap" ] || [ "$PLE_MODE" = "resident" ] || [ "$PLE_MODE" = "staged" ]; then
   PLE_ENV=(-e QWEN4EXP_PLE_MMAP=1 -e QWEN4EXP_PLE_MMAP_THREADS="${PLE_WORKERS:-64}")
   # resident: each rank keeps its slice of the FP8 table as a plain GPU tensor behind our gather op
   # (compile stays on, no Inductor copy of the table). TP2: 23.8 GiB per rank, TP4: 11.9 GiB.
   [ "$PLE_MODE" = "resident" ] && PLE_ENV+=(-e QWEN4EXP_PLE_RESIDENT=1)
-  PLE_MOUNT=(-v "$PATCH_DIR/ple_layer.py:$VP/models/qwen4_exp/nvidia/ple_layer.py:ro"
-             -v "$PATCH_DIR/ple_mmap.py:$VP/models/qwen4_exp/nvidia/ops/ple_mmap.py:ro")
   # staged: rows gathered in the model state's prepare_inputs (before the FULL graph replay) -> decode CUDA graphs with the table on disk
   if [ "$PLE_MODE" = "staged" ]; then
     PLE_ENV+=(-e QWEN4EXP_PLE_STAGED=1)
@@ -83,23 +86,32 @@ fi
 ASYNC_ARGS=(); [ "${ASYNC_SCHED:-0}" = "1" ] && ASYNC_ARGS=(--async-scheduling)
 docker rm -f "$NAME" 2>/dev/null || true
 sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
+MODEL_MOUNT="-v $MODEL_HOST:/models/qwen38fn:ro"
+MODEL_SERVE_PATH="/models/qwen38fn"
+if [[ "$MODEL_HOST" =~ /snapshots/ ]]; then
+  MODEL_REPO="${MODEL_HOST%/snapshots/*}"
+  SNAPSHOT_NAME="${MODEL_HOST##*/}"
+  MODEL_MOUNT="-v $MODEL_REPO:/models/hub_repo:ro"
+  MODEL_SERVE_PATH="/models/hub_repo/snapshots/$SNAPSHOT_NAME"
+fi
+
 docker run --gpus all -d --name "$NAME" --restart no \
   --network host --ipc host --shm-size 32g --ulimit memlock=-1:-1 --cap-add IPC_LOCK \
   --device /dev/infiniband:/dev/infiniband \
-  -v "$MODEL_HOST:/models/qwen38fn:ro" -v "$CACHE_HOST:/root/.cache" \
+  $MODEL_MOUNT -v "$CACHE_HOST:/root/.cache" \
   -e VLLM_HOST_IP="$HOST_IP" -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e CUTE_DSL_ARCH=sm_121a \
   -e TORCH_CUDA_ARCH_LIST=12.1a -e FLASHINFER_CUDA_ARCH_LIST=12.1a -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
   -e VLLM_USE_DEEP_GEMM=0 -e VLLM_USE_V2_MODEL_RUNNER=1 \
   -e NCCL_NET=IB -e NCCL_IB_DISABLE=0 -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 \
-  -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_ADDR_RANGE=192.168.192.0/24 \
+  -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_ADDR_RANGE="${ADDR_RANGE:-192.168.177.0/24}" \
   -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 -e TP_SOCKET_IFNAME=enp1s0f0np0 -e MN_IF_NAME=enp1s0f0np0 \
   -e NCCL_NVLS_ENABLE=0 -e NCCL_CROSS_NIC=0 -e NCCL_IB_MERGE_NICS=0 -e NCCL_CUMEM_ENABLE=0 \
   -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_DEBUG=WARN -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
   ${NCCL_CHANNELS:+-e NCCL_MAX_NCHANNELS=$NCCL_CHANNELS -e NCCL_MIN_NCHANNELS=$NCCL_CHANNELS} \
   "${PLE_ENV[@]}" "${PLE_MOUNT[@]}" "${DRAFT_ENV[@]}" "${DRAFT_MOUNT[@]}" "${OVERLAY_MOUNT[@]}" "${GRAPH_MOUNT[@]}" ${DOCKER_EXTRA:-} \
   "$IMAGE" \
-    /models/qwen38fn --served-model-name qwen3.8-flash-next \
+    "$MODEL_SERVE_PATH" --served-model-name qwen3.8-flash-next \
     --host 0.0.0.0 --port "$PORT" --trust-remote-code \
     --quantization modelopt --tensor-parallel-size 2 \
     --max-model-len "$MAXLEN" --max-num-seqs "$SEQS" --gpu-memory-utilization "$GMU" --max-num-batched-tokens "$CHUNK" \

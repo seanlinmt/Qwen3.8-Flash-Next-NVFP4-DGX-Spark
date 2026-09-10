@@ -172,41 +172,21 @@ def _get_ple_embedding_quant_method(
     quant_config: QuantizationConfig | None,
     prefix: str,
 ) -> QuantizeMethodBase | None:
-    """Select global-scale FP8 only for quantized PLE checkpoint shards."""
+    """Select global-scale FP8 for quantized PLE checkpoint shards."""
 
     if _ple_mmap_enabled():
         # Disk-backed table requested: the FP8 embedding method is the one that
-        # knows how to keep a 1-row placeholder, and every checkpoint this patch
-        # is used with (NVIDIA ModelOpt, RadixArk, albucino's W4A16 + FP8 PLE)
-        # ships the table as FP8 shards plus one global weight_scale. Deciding
-        # from the checkpoint's quant config alone (below) misses the mixed
-        # builds, which then allocate the whole table slice in VRAM (2026-09-06,
-        # 4x3090 boot: 23.8 GiB per card, OOM before the weights).
+        # knows how to keep a 1-row placeholder.
         return Qwen4ExpPLEFp8EmbeddingMethod()
 
-    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
-        if quant_config._resolve_quant_algo(prefix) == "FP8":
-            return Qwen4ExpPLEFp8EmbeddingMethod()
-        return None
+    # All ModelOpt (NVFP4, Mixed Precision, FP8) and FP8 checkpoints of
+    # Qwen3.8-Flash-Next ship the PLE table as FP8 shards with a global weight_scale.
+    # We must instantiate Qwen4ExpPLEFp8EmbeddingMethod so weight_scale parameter
+    # is registered and loaded, even if quant_algo is NVFP4 with *.ple.* ignored.
+    if quant_config is not None:
+        return Qwen4ExpPLEFp8EmbeddingMethod()
 
-    if not isinstance(quant_config, Fp8Config):
-        return None
-    if not quant_config.is_checkpoint_fp8_serialized:
-        return None
-
-    ignored_layers = quant_config.ignored_layers
-    if is_layer_skipped(
-        prefix,
-        ignored_layers,
-        quant_config.packed_modules_mapping,
-        match_mode=quant_config.ignored_layers_match_mode,
-    ):
-        return None
-    # PLE checkpoint shards form one runtime embedding parameter.
-    shard_prefix = f"{prefix}.shard_"
-    if any(name.startswith(shard_prefix) for name in ignored_layers):
-        return None
-    return Qwen4ExpPLEFp8EmbeddingMethod()
+    return None
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
