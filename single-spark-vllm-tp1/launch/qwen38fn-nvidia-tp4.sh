@@ -69,6 +69,12 @@ SPEC=(); if [ "$MTP" != "0" ]; then
 fi
 # ASYNC_SCHED=1 adds --async-scheduling (also from Chuck 208's list)
 ASYNC_ARGS=(); [ "${ASYNC_SCHED:-0}" = "1" ] && ASYNC_ARGS=(--async-scheduling)
+EXTRA_NCCL_ARGS=()
+if [ -n "${GID_INDEX:-}" ]; then
+  EXTRA_NCCL_ARGS+=("-e" "NCCL_IB_GID_INDEX=$GID_INDEX")
+elif [ -n "${NCCL_IB_GID_INDEX:-}" ]; then
+  EXTRA_NCCL_ARGS+=("-e" "NCCL_IB_GID_INDEX=$NCCL_IB_GID_INDEX")
+fi
 docker rm -f "$NAME" 2>/dev/null || true
 sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
 docker run --gpus all -d --name "$NAME" --restart no \
@@ -79,11 +85,18 @@ docker run --gpus all -d --name "$NAME" --restart no \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e CUTE_DSL_ARCH=sm_121a \
   -e TORCH_CUDA_ARCH_LIST=12.1a -e FLASHINFER_CUDA_ARCH_LIST=12.1a -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
   -e VLLM_USE_DEEP_GEMM=0 -e VLLM_USE_V2_MODEL_RUNNER=1 \
-  -e NCCL_NET=IB -e NCCL_IB_DISABLE=0 -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 \
-  -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_ADDR_RANGE=192.168.192.0/24 \
-  -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 -e TP_SOCKET_IFNAME=enp1s0f0np0 -e MN_IF_NAME=enp1s0f0np0 \
-  -e NCCL_NVLS_ENABLE=0 -e NCCL_CROSS_NIC=0 -e NCCL_IB_MERGE_NICS=0 -e NCCL_CUMEM_ENABLE=0 \
-  -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_DEBUG=WARN -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+  -e NCCL_NET=IB -e NCCL_IB_DISABLE=0 \
+  -e NCCL_IB_HCA="${NCCL_IB_HCA:-rocep1s0f0,roceP2p1s0f0}" \
+  "${EXTRA_NCCL_ARGS[@]}" \
+  -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET \
+  -e NCCL_IB_ADDR_RANGE="${NCCL_IB_ADDR_RANGE:-192.168.192.0/22}" \
+  -e NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-enp1s0f0np0,enP2p1s0f0np0}" \
+  -e GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-enp1s0f0np0,enP2p1s0f0np0}" \
+  -e TP_SOCKET_IFNAME="${TP_SOCKET_IFNAME:-enp1s0f0np0,enP2p1s0f0np0}" \
+  -e MN_IF_NAME="${MN_IF_NAME:-enp1s0f0np0,enP2p1s0f0np0}" \
+  -e NCCL_NVLS_ENABLE=0 -e NCCL_CROSS_NIC="${NCCL_CROSS_NIC:-1}" -e NCCL_IB_MERGE_NICS="${NCCL_IB_MERGE_NICS:-1}" \
+  -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
+  -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
   "${PLE_ENV[@]}" "${PLE_MOUNT[@]}" "${DRAFT_ENV[@]}" "${DRAFT_MOUNT[@]}" "${OVERLAY_MOUNT[@]}" "${GRAPH_MOUNT[@]}" ${DOCKER_EXTRA:-} \
   "$IMAGE" \
     /models/qwen38fn --served-model-name qwen3.8-flash-next \
